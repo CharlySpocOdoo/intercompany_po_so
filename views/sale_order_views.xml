@@ -11,13 +11,14 @@
             <!--
                 Insertamos el campo justo después del campo 'name' (número de SO)
                 visible solo cuando existe una PO vinculada.
+                En Odoo 18 se usa invisible="expresión" directamente, attrs ya no existe.
             -->
             <xpath expr="//field[@name='name']" position="after">
                 <field
                     name="intercompany_po_id"
                     string="Orden de Compra Origen"
                     readonly="1"
-                    attrs="{'invisible': [('intercompany_po_id', '=', False)]}"
+                    invisible="not intercompany_po_id"
                     options="{'no_open': False}"
                 />
             </xpath>
