@@ -8,19 +8,20 @@
         <field name="inherit_id" ref="purchase.purchase_order_form"/>
         <field name="arch" type="xml">
 
-            <!--
-                Insertamos el campo justo después del campo 'name' (número de PO)
-                visible solo cuando ya existe una SO vinculada.
-                En Odoo 18 se usa invisible="expresión" directamente, attrs ya no existe.
-            -->
-            <xpath expr="//field[@name='name']" position="after">
-                <field
-                    name="intercompany_so_id"
-                    string="Cotización Intercompañía"
-                    readonly="1"
+            <!-- Smart button: abre la SO intercompañía desde el button_box de la PO -->
+            <xpath expr="//div[@name='button_box']" position="inside">
+                <button
+                    class="oe_stat_button"
+                    icon="fa-file-text-o"
+                    type="object"
+                    name="action_open_intercompany_so"
                     invisible="not intercompany_so_id"
-                    options="{'no_open': False}"
-                />
+                >
+                    <div class="o_stat_info">
+                        <span class="o_stat_text">Cotización Venta</span>
+                        <field name="intercompany_so_id" string="" readonly="1"/>
+                    </div>
+                </button>
             </xpath>
 
         </field>

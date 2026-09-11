@@ -123,6 +123,16 @@ class SaleOrder(models.Model):
             % (self.name, self.company_id.name)
         )
 
+    def action_open_intercompany_po(self):
+        self.ensure_one()
+        return {
+            'type': 'ir.actions.act_window',
+            'res_model': 'purchase.order',
+            'res_id': self.intercompany_po_id.id,
+            'view_mode': 'form',
+            'target': 'current',
+        }
+
     def _prepare_intercompany_po_vals(self, dest_company, vendor_partner):
         """
         Prepara el diccionario de valores para crear la Purchase Order en Empresa B.
