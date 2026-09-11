@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
+import logging
+
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class PurchaseOrder(models.Model):
@@ -23,7 +27,14 @@ class PurchaseOrder(models.Model):
         res = super().button_confirm()
 
         for order in self:
-            order._create_intercompany_sale_order()
+            if order.state == 'purchase':
+                try:
+                    order._create_intercompany_sale_order()
+                except Exception:
+                    _logger.exception(
+                        'No se pudo crear la cotización intercompañía para la orden de compra %s.',
+                        order.name,
+                    )
 
         return res
 
@@ -81,18 +92,21 @@ class PurchaseOrder(models.Model):
         so_vals = self._prepare_intercompany_so_vals(dest_company, customer_partner)
         sale_order = SaleOrder.create(so_vals)
 
-        # --- 5. Crear las líneas de la SO ---
+        # --- 5. Crear las líneas de la SO (todas juntas, en una sola llamada a create) ---
+        sol_vals_list = []
         for po_line in self.order_line:
             if po_line.display_type:
                 # Líneas de sección o nota, se copian tal cual
-                self.env['sale.order.line'].sudo().with_company(dest_company).create({
+                sol_vals_list.append({
                     'order_id': sale_order.id,
                     'display_type': po_line.display_type,
                     'name': po_line.name,
                 })
             else:
-                sol_vals = self._prepare_intercompany_sol_vals(po_line, sale_order)
-                self.env['sale.order.line'].sudo().with_company(dest_company).create(sol_vals)
+                sol_vals_list.append(self._prepare_intercompany_sol_vals(po_line, sale_order, dest_company))
+
+        if sol_vals_list:
+            self.env['sale.order.line'].sudo().with_company(dest_company).create(sol_vals_list)
 
         # --- 6. Vincular ambos documentos entre sí (trazabilidad bidireccional) ---
         self.intercompany_so_id = sale_order.id
@@ -126,16 +140,26 @@ class PurchaseOrder(models.Model):
             ) % (self.name, self.company_id.name),
         }
 
-    def _prepare_intercompany_sol_vals(self, po_line, sale_order):
+    def _prepare_intercompany_sol_vals(self, po_line, sale_order, dest_company):
         """
         Prepara el diccionario de valores para cada línea de la Sale Order.
         Toma producto, cantidad, precio y descripción de la línea de PO.
+        El price_unit se convierte de la moneda de la compañía origen a la
+        moneda de la compañía destino usando el mecanismo estándar de Odoo.
         """
+        price_unit = po_line.price_unit
+        src_currency = self.currency_id
+        dest_currency = dest_company.currency_id
+        if src_currency and dest_currency and src_currency != dest_currency:
+            price_unit = src_currency._convert(
+                price_unit, dest_currency, dest_company, self.date_order or fields.Date.context_today(self)
+            )
+
         return {
             'order_id': sale_order.id,
             'product_id': po_line.product_id.id,
             'name': po_line.name,
             'product_uom_qty': po_line.product_qty,
             'product_uom': po_line.product_uom.id,
-            'price_unit': po_line.price_unit,
+            'price_unit': price_unit,
         }
