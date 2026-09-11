@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
+import logging
+
 from odoo import models, fields, _
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class SaleOrder(models.Model):
@@ -25,7 +29,13 @@ class SaleOrder(models.Model):
 
         for order in self:
             if order.state == 'sale':
-                order.create_intercompany_purchase_order()
+                try:
+                    order.create_intercompany_purchase_order()
+                except Exception:
+                    _logger.exception(
+                        'No se pudo crear la orden de compra intercompañía para la cotización de venta %s.',
+                        order.name,
+                    )
 
         return res
 
