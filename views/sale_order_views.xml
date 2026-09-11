@@ -18,7 +18,7 @@
                     invisible="not intercompany_po_id"
                 >
                     <div class="o_stat_info">
-                        <span class="o_stat_text">Compra Origen</span>
+                        <field name="intercompany_po_button_label" class="o_stat_text"/>
                         <field name="intercompany_po_id" string="" readonly="1"/>
                     </div>
                 </button>

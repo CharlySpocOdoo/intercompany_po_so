@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 
-from odoo import models, fields, _
+from odoo import models, fields, api, _
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
@@ -17,6 +17,19 @@ class SaleOrder(models.Model):
         readonly=True,
         help='Orden de compra en la empresa hermana que originó esta cotización automáticamente.',
     )
+
+    intercompany_po_button_label = fields.Char(
+        compute='_compute_intercompany_po_button_label',
+        store=False,
+    )
+
+    @api.depends('intercompany_po_id', 'intercompany_po_id.company_id')
+    def _compute_intercompany_po_button_label(self):
+        for record in self:
+            if record.intercompany_po_id:
+                record.intercompany_po_button_label = 'Compra Generada en ' + record.intercompany_po_id.company_id.name
+            else:
+                record.intercompany_po_button_label = ''
 
     def action_confirm(self):
         """

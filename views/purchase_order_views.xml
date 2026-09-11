@@ -18,7 +18,7 @@
                     invisible="not intercompany_so_id"
                 >
                     <div class="o_stat_info">
-                        <span class="o_stat_text">Cotización Venta</span>
+                        <field name="intercompany_so_button_label" class="o_stat_text"/>
                         <field name="intercompany_so_id" string="" readonly="1"/>
                     </div>
                 </button>

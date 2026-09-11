@@ -18,6 +18,19 @@ class PurchaseOrder(models.Model):
         help='Cotización de venta generada automáticamente en la empresa proveedora hermana.',
     )
 
+    intercompany_so_button_label = fields.Char(
+        compute='_compute_intercompany_so_button_label',
+        store=False,
+    )
+
+    @api.depends('intercompany_so_id', 'intercompany_so_id.company_id')
+    def _compute_intercompany_so_button_label(self):
+        for record in self:
+            if record.intercompany_so_id:
+                record.intercompany_so_button_label = 'Venta Origen en ' + record.intercompany_so_id.company_id.name
+            else:
+                record.intercompany_so_button_label = ''
+
     def button_confirm(self):
         """
         Sobreescribe la confirmación de la PO.
