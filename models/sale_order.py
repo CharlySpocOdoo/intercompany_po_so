@@ -124,7 +124,8 @@ class SaleOrder(models.Model):
 
         # --- 6. Vincular ambos documentos entre sí (trazabilidad bidireccional) ---
         self.intercompany_po_id = purchase_order.id
-        purchase_order.sudo().intercompany_so_id = self.id
+        # 1.2.0: en la misma escritura, el sentido: esta compra nació de la venta (no es su origen).
+        purchase_order.sudo().write({'intercompany_so_id': self.id, 'intercompany_origen': 'venta'})
 
         # --- 7. Registrar mensaje en el chatter de ambos documentos ---
         self.message_post(

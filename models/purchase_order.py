@@ -21,6 +21,16 @@ class PurchaseOrder(models.Model):
         help='Cotización de venta generada automáticamente en la empresa proveedora hermana.',
     )
 
+    # 1.2.0: quién creó a quién. El vínculo intercompany_so_id es igual en los dos sentidos; este campo los distingue.
+    intercompany_origen = fields.Selection(
+        [('compra', 'La compra creó la venta'), ('venta', 'La venta creó la compra')],
+        string='Origen intercompañía',
+        copy=False,
+        readonly=True,
+        help='«compra»: esta compra creó la venta de la empresa hermana; los cambios de la compra se pasan a la '
+             'venta o se bloquean. «venta»: esta compra nació de una venta de la hermana; no se toca la venta.',
+    )
+
     intercompany_so_button_label = fields.Char(
         compute='_compute_intercompany_so_button_label',
         store=False,
@@ -118,6 +128,7 @@ class PurchaseOrder(models.Model):
                     'order_id': sale_order.id,
                     'display_type': po_line.display_type,
                     'name': po_line.name,
+                    'intercompany_purchase_line_id': po_line.id,      # 1.2.0: vínculo de líneas
                 })
                 po_lines_en_orden.append(None)
             else:
@@ -130,7 +141,8 @@ class PurchaseOrder(models.Model):
             self._intercompany_revisar_totales(sale_order, pares, dest_company)
 
         # --- 6. Vincular ambos documentos entre sí (trazabilidad bidireccional) ---
-        self.intercompany_so_id = sale_order.id
+        # 1.2.0: en la misma escritura, el sentido: esta compra es el origen de la venta.
+        self.write({'intercompany_so_id': sale_order.id, 'intercompany_origen': 'compra'})
         sale_order.sudo().intercompany_po_id = self.id
 
         # --- 7. Registrar mensaje en el chatter de ambos documentos ---
@@ -224,6 +236,7 @@ class PurchaseOrder(models.Model):
             'product_uom_qty': po_line.product_qty,
             'product_uom': po_line.product_uom.id,
             'price_unit': price_unit,
+            'intercompany_purchase_line_id': po_line.id,          # 1.2.0: vínculo de líneas
         }
         descuento = self._intercompany_descuento(po_line)
         if descuento:
@@ -266,3 +279,193 @@ class PurchaseOrder(models.Model):
             sale_order.sudo().message_post(body=_(
                 'No se pudieron revisar los totales contra la compra %s. Revisa a mano que los totales coincidan.'
             ) % self.name)
+
+    # ── 1.2.0 · Cambios de la compra después de crear la venta (Charly, 2026-11-19, «la A») ─────────────────────
+    # Solo cuando ESTA compra es el origen de la venta (intercompany_origen = 'compra'). Con 'venta' no se hace nada.
+
+    def _intercompany_origen_efectivo(self):
+        """'compra', 'venta' o False. Si el campo está vacío (compras de antes de la 1.2.0), lo deduce y lo guarda:
+        1) la venta tiene líneas con vínculo de línea → compra; 2) origin (cada flujo pone el nombre del documento de
+        origen en el otro); 3) cuál se creó primero, con al menos un segundo de diferencia. Si nada decide, avisa en la
+        conversación de la compra y no se toca nada."""
+        self.ensure_one()
+        if not self.intercompany_so_id:
+            return False
+        if self.intercompany_origen:
+            return self.intercompany_origen
+        venta = self.intercompany_so_id.sudo()
+        origen = False
+        if venta.order_line.filtered('intercompany_purchase_line_id'):
+            origen = 'compra'
+        elif venta.origin == self.name and self.origin != venta.name:
+            origen = 'compra'
+        elif self.origin == venta.name and venta.origin != self.name:
+            origen = 'venta'
+        elif self.create_date and venta.create_date and abs((self.create_date - venta.create_date).total_seconds()) >= 1:
+            origen = 'compra' if self.create_date < venta.create_date else 'venta'
+        if origen:
+            self.sudo().with_context(intercompany_sincronizando=True).write({'intercompany_origen': origen})
+        else:
+            self.message_post(body=_(
+                'No se pudo saber si esta compra creó la venta %s o nació de ella. No se actualizó ni se bloqueó '
+                'nada en la venta. Revisa a mano.'
+            ) % venta.name)
+        return origen
+
+    @staticmethod
+    def _intercompany_venta_editable(venta):
+        return venta.state in ('draft', 'sent')
+
+    def _intercompany_emparejar(self, venta, excluir=None):
+        """Ventas de antes de la 1.2.0, sin vínculo de líneas: empareja por producto y posición (la 1.ª línea de
+        compra del producto X con la 1.ª de venta del producto X…). Solo si TODO empareja; si no, regresa False."""
+        lineas_v = venta.order_line.filtered(lambda s: not s.display_type)
+        if lineas_v.filtered('intercompany_purchase_line_id'):
+            return True
+        excluir = excluir or self.env['purchase.order.line']
+        lineas_c = self.order_line.filtered(lambda l: not l.display_type and l.id not in excluir.ids)
+
+        def por_producto(lineas):
+            grupos = {}
+            for linea in lineas.sorted(lambda x: (x.sequence, x.id)):
+                grupos.setdefault(linea.product_id.id, []).append(linea)
+            return grupos
+
+        gc, gv = por_producto(lineas_c), por_producto(lineas_v)
+        if set(gc) != set(gv) or any(len(gc[p]) != len(gv[p]) for p in gc):
+            return False
+        for producto, compras in gc.items():
+            for linea_c, linea_v in zip(compras, gv[producto]):
+                linea_v.with_context(intercompany_sincronizando=True).write(
+                    {'intercompany_purchase_line_id': linea_c.id})
+        return True
+
+    def _intercompany_valores_actualizar(self, po_line, venta, empresa, con_producto):
+        """Los valores para que la línea de venta quede como la de compra: cantidad, unidad, precio (regla 1.1.0) y
+        descuento, siempre juntos para que la lista de precios de la venta no los recalcule."""
+        vals = self._prepare_intercompany_sol_vals(po_line, venta, empresa)
+        vals.pop('order_id', None)
+        vals.pop('intercompany_purchase_line_id', None)
+        if not con_producto:
+            vals.pop('product_id', None)
+            vals.pop('name', None)
+        vals.setdefault('discount', 0.0)
+        return vals
+
+    def _intercompany_nota(self, venta, texto_compra, texto_venta, detalle):
+        """Nota en las DOS conversaciones."""
+        filas = Markup('').join(Markup('<li>%s</li>') % d for d in detalle)
+        self.message_post(body=Markup('<p>%s</p><ul>%s</ul>') % (texto_compra, filas))
+        venta.message_post(body=Markup('<p>%s</p><ul>%s</ul>') % (texto_venta, filas))
+
+    def _intercompany_pasar_a_venta(self, lineas, antes=None):
+        """Después de crear o cambiar líneas de esta compra (origen de la venta):
+        - venta en borrador o enviada: la línea de venta vinculada queda como la de compra (se crea si falta);
+          se revisan los totales y queda nota en las dos conversaciones;
+        - venta confirmada o cancelada: se deja guardar y queda un aviso en las dos conversaciones con lo que cambió.
+        Es idempotente: si la línea de venta ya está igual, no hace nada."""
+        self.ensure_one()
+        venta = self.intercompany_so_id.sudo()
+        empresa = venta.company_id
+        antes = antes or {}
+        cambios = []
+        for linea in lineas.filtered(lambda l: not l.display_type):
+            despues = linea._intercompany_foto()
+            previo = antes.get(linea.id)
+            if previo is None or linea._intercompany_difiere(previo, despues):
+                cambios.append((linea, previo, despues))
+        if not cambios:
+            return
+        if not self._intercompany_venta_editable(venta):
+            estado = _('cancelada') if venta.state == 'cancel' else _('confirmada')
+            detalle = [linea._intercompany_describir(previo, despues) for linea, previo, despues in cambios]
+            self._intercompany_nota(
+                venta,
+                _('La compra cambió, pero la venta %(venta)s de %(empresa)s ya está %(estado)s y NO se actualizó. '
+                  'Ajústala en %(empresa)s.', venta=venta.name, empresa=empresa.name, estado=estado),
+                _('La compra %(compra)s de %(empresa)s cambió, pero esta venta ya está %(estado)s y NO se actualizó. '
+                  'Revisa si hay que ajustarla.', compra=self.name, empresa=self.company_id.name, estado=estado),
+                detalle)
+            return
+        if not self._intercompany_emparejar(venta, excluir=lineas.filtered(lambda l: l.id not in antes)):
+            self._intercompany_nota(
+                venta,
+                _('No se pudo relacionar la venta %s con esta compra, línea por línea. No se actualizó. Revisa a mano.')
+                % venta.name,
+                _('No se pudo relacionar esta venta con la compra %s, línea por línea. No se actualizó. Revisa a mano.')
+                % self.name,
+                [linea._intercompany_describir(previo, despues) for linea, previo, despues in cambios])
+            return
+        LineaVenta = self.env['sale.order.line'].sudo().with_company(empresa).with_context(
+            intercompany_sincronizando=True)
+        pares, detalle = [], []
+        for linea, previo, despues in cambios:
+            linea_v = venta.order_line.filtered(lambda s, l=linea: s.intercompany_purchase_line_id.id == l.id)
+            if linea_v:
+                con_producto = bool(previo) and previo['product_id'] != despues['product_id']
+                vals = self._intercompany_valores_actualizar(linea, venta, empresa, con_producto)
+                antes_v = [(v.product_uom_qty, v.price_unit, v.discount) for v in linea_v]
+                linea_v.with_company(empresa).with_context(intercompany_sincronizando=True).write(vals)
+                texto = linea._intercompany_describir(previo, despues) + _(
+                    ' → venta: antes %(antes)s; ahora cantidad %(cant)s, precio %(precio)s, descuento %(desc)s %%',
+                    antes='; '.join(_('cantidad %(c)s, precio %(p)s, descuento %(d)s %%', c=_n(c), p=_n(p), d=_n(d))
+                                    for c, p, d in antes_v),
+                    cant=_n(vals.get('product_uom_qty', 0.0)), precio=_n(vals.get('price_unit', 0.0)),
+                    desc=_n(vals.get('discount', 0.0)))
+            else:
+                linea_v = LineaVenta.create(self._prepare_intercompany_sol_vals(linea, venta, empresa))
+                texto = linea._intercompany_describir(None, despues) + _(' → se agregó a la venta.')
+            pares += [(linea, v) for v in linea_v]
+            detalle.append(texto)
+        self._intercompany_nota(
+            venta,
+            _('Se actualizó la venta %(venta)s de %(empresa)s por cambios en esta compra:',
+              venta=venta.name, empresa=empresa.name),
+            _('Actualizada desde la compra %(compra)s de %(empresa)s:', compra=self.name, empresa=self.company_id.name),
+            detalle)
+        self._intercompany_revisar_totales(venta, pares, empresa)
+
+    def _intercompany_lineas_quitadas(self, lineas):
+        """Antes de borrar líneas de esta compra (origen de la venta): con la venta en borrador o enviada, se quitan
+        sus líneas de venta; si no, aviso en las dos conversaciones."""
+        self.ensure_one()
+        venta = self.intercompany_so_id.sudo()
+        empresa = venta.company_id
+        de_producto = lineas.filtered(lambda l: not l.display_type)
+        detalle = [_('%(producto)s: cantidad %(cant)s', producto=l.product_id.display_name or l.name,
+                     cant=_n(l.product_qty)) for l in de_producto]
+        if not self._intercompany_venta_editable(venta):
+            if detalle:
+                estado = _('cancelada') if venta.state == 'cancel' else _('confirmada')
+                self._intercompany_nota(
+                    venta,
+                    _('Se quitaron líneas de la compra, pero la venta %(venta)s ya está %(estado)s y NO se actualizó. '
+                      'Ajústala en %(empresa)s.', venta=venta.name, estado=estado, empresa=empresa.name),
+                    _('Se quitaron líneas de la compra %(compra)s, pero esta venta ya está %(estado)s y NO se '
+                      'actualizó. Revisa si hay que ajustarla.', compra=self.name, estado=estado),
+                    detalle)
+            return
+        if not self._intercompany_emparejar(venta):
+            if detalle:
+                self._intercompany_nota(
+                    venta,
+                    _('No se pudo relacionar la venta %s con esta compra; no se quitaron líneas de la venta. Revisa a '
+                      'mano.') % venta.name,
+                    _('No se pudo relacionar esta venta con la compra %s; no se quitaron sus líneas. Revisa a mano.')
+                    % self.name,
+                    detalle)
+            return
+        lineas_v = venta.order_line.filtered(lambda s: s.intercompany_purchase_line_id.id in lineas.ids)
+        if lineas_v:
+            lineas_v.with_context(intercompany_sincronizando=True).unlink()
+        if detalle:
+            self._intercompany_nota(
+                venta,
+                _('Se quitaron de la venta %s las líneas que se quitaron de esta compra:') % venta.name,
+                _('Se quitaron líneas porque se quitaron de la compra %s:') % self.name,
+                detalle)
+
+
+def _n(x):
+    """12.0 → «12»; 115.9900 → «115.99». Para las notas."""
+    return ('%.4f' % (x or 0.0)).rstrip('0').rstrip('.')

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Intercompany PO to SO',
-    'version': '18.0.1.1.0',
+    'version': '18.0.1.2.0',
     'summary': 'Genera automáticamente una cotización de venta en empresa hermana al confirmar una orden de compra intercompañía.',
     'description': """
         Al confirmar una Orden de Compra cuyo proveedor es una empresa hermana
