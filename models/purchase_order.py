@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 import logging
 
+from markupsafe import Markup
+
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
+from odoo.tools import float_round, format_amount
 
 _logger = logging.getLogger(__name__)
 
@@ -107,6 +110,7 @@ class PurchaseOrder(models.Model):
 
         # --- 5. Crear las líneas de la SO (todas juntas, en una sola llamada a create) ---
         sol_vals_list = []
+        po_lines_en_orden = []          # 1.1.0: la línea de compra de cada línea de venta, para revisar los totales
         for po_line in self.order_line:
             if po_line.display_type:
                 # Líneas de sección o nota, se copian tal cual
@@ -115,11 +119,15 @@ class PurchaseOrder(models.Model):
                     'display_type': po_line.display_type,
                     'name': po_line.name,
                 })
+                po_lines_en_orden.append(None)
             else:
                 sol_vals_list.append(self._prepare_intercompany_sol_vals(po_line, sale_order, dest_company))
+                po_lines_en_orden.append(po_line)
 
         if sol_vals_list:
-            self.env['sale.order.line'].sudo().with_company(dest_company).create(sol_vals_list)
+            so_lines = self.env['sale.order.line'].sudo().with_company(dest_company).create(sol_vals_list)
+            pares = [(po_l, so_l) for po_l, so_l in zip(po_lines_en_orden, so_lines) if po_l]
+            self._intercompany_revisar_totales(sale_order, pares, dest_company)
 
         # --- 6. Vincular ambos documentos entre sí (trazabilidad bidireccional) ---
         self.intercompany_so_id = sale_order.id
@@ -161,22 +169,55 @@ class PurchaseOrder(models.Model):
             ) % (self.name, self.company_id.name),
         }
 
-    def _prepare_intercompany_sol_vals(self, po_line, sale_order, dest_company):
+    def _intercompany_precio_venta(self, po_line):
         """
-        Prepara el diccionario de valores para cada línea de la Sale Order.
-        Toma producto, cantidad, precio y descripción de la línea de PO.
-        El price_unit se convierte de la moneda de la compañía origen a la
-        moneda de la compañía destino usando el mecanismo estándar de Odoo.
+        1.1.0 (Charly, 2026-11-19, «la B»): la venta de la hermana debe quedar con el MISMO TOTAL que la línea de
+        compra. Las ventas siempre van con IVA incluido.
+        - Si los impuestos de la línea de compra NO son de precio incluido (por ejemplo «16% No Incluido»), el precio
+          de venta es el total con impuestos de la línea (price_total, que Odoo calcula con compute_all de esos
+          impuestos y ya trae el descuento) entre la cantidad y entre (1 − descuento). Así, con el mismo descuento y
+          el IVA incluido de la venta, el total de la venta es el de la compra.
+        - Si son de precio incluido, o la línea no tiene impuestos, el precio se queda igual que antes (price_unit).
+        Decide con los impuestos reales de la línea: no depende de rdl_compra_iva.
+        Devuelve el precio en la moneda de la compra, sin redondear.
         """
-        price_unit = po_line.price_unit
+        impuestos = po_line.taxes_id
+        cantidad = po_line.product_qty
+        factor = 1.0 - (self._intercompany_descuento(po_line) / 100.0)
+        if not impuestos or all(impuestos.mapped('price_include')) or not cantidad or factor <= 0:
+            return po_line.price_unit
+        return po_line.price_total / (cantidad * factor)
+
+    @staticmethod
+    def _intercompany_descuento(po_line):
+        """El descuento de la línea de compra (0 si el campo no existe)."""
+        return (po_line.discount or 0.0) if 'discount' in po_line._fields else 0.0
+
+    def _intercompany_a_moneda_destino(self, importe, dest_company):
+        """Convierte un importe de la moneda de la compra a la de la empresa destino, SIN redondear."""
         src_currency = self.currency_id
         dest_currency = dest_company.currency_id
         if src_currency and dest_currency and src_currency != dest_currency:
-            price_unit = src_currency._convert(
-                price_unit, dest_currency, dest_company, self.date_order or fields.Date.context_today(self)
+            return src_currency._convert(
+                importe, dest_currency, dest_company, self.date_order or fields.Date.context_today(self), round=False
             )
+        return importe
 
-        return {
+    def _prepare_intercompany_sol_vals(self, po_line, sale_order, dest_company):
+        """
+        Prepara el diccionario de valores para cada línea de la Sale Order.
+        Toma producto, cantidad, precio, descuento y descripción de la línea de PO.
+        El price_unit se convierte de la moneda de la compañía origen a la
+        moneda de la compañía destino usando el mecanismo estándar de Odoo.
+        1.1.0: el precio sale de _intercompany_precio_venta (mismo total que la compra, «la B»), se redondea a los
+        decimales de «Product Price», y el descuento de la compra se copia a la venta.
+        """
+        precio = self._intercompany_precio_venta(po_line)
+        price_unit = self._intercompany_a_moneda_destino(precio, dest_company)
+        decimales = self.env['decimal.precision'].precision_get('Product Price')
+        price_unit = float_round(price_unit, precision_digits=decimales)
+
+        vals = {
             'order_id': sale_order.id,
             'product_id': po_line.product_id.id,
             'name': po_line.name,
@@ -184,3 +225,44 @@ class PurchaseOrder(models.Model):
             'product_uom': po_line.product_uom.id,
             'price_unit': price_unit,
         }
+        descuento = self._intercompany_descuento(po_line)
+        if descuento:
+            vals['discount'] = descuento
+        return vals
+
+    def _intercompany_revisar_totales(self, sale_order, pares, dest_company):
+        """
+        1.1.0: compara el total de cada línea de venta con el de su línea de compra. Si alguno no cuadra (por los
+        decimales del precio, o porque el impuesto de venta del producto en la hermana no es de precio incluido),
+        lo avisa en la conversación de la venta, con la diferencia. No ajusta nada y nunca falla en silencio: si la
+        revisión misma fallara, también lo dice en la conversación.
+        """
+        try:
+            moneda = sale_order.currency_id or dest_company.currency_id
+            diferencias = []
+            for po_line, so_line in pares:
+                esperado = moneda.round(self._intercompany_a_moneda_destino(po_line.price_total, dest_company))
+                obtenido = so_line.price_total
+                if moneda.compare_amounts(esperado, obtenido) != 0:
+                    diferencias.append((so_line.product_id.display_name or so_line.name, esperado, obtenido))
+            if not diferencias:
+                return
+            filas = Markup('').join(
+                Markup('<li>%s: compra %s, venta %s (diferencia %s)</li>') % (
+                    nombre, format_amount(self.env, esperado, moneda), format_amount(self.env, obtenido, moneda),
+                    format_amount(self.env, obtenido - esperado, moneda))
+                for nombre, esperado, obtenido in diferencias
+            )
+            total = sum(o - e for _n, e, o in diferencias)
+            sale_order.sudo().message_post(body=Markup(
+                '<p><b>Revisión contra la compra %s:</b> %s línea(s) no dan exactamente el mismo total que la compra. '
+                'Diferencia total: %s. Revisa el precio o el impuesto de esas líneas antes de confirmar.</p><ul>%s</ul>'
+            ) % (self.name, len(diferencias), format_amount(self.env, total, moneda), filas))
+            _logger.warning('Intercompañía: la cotización %s no cuadra con la compra %s en %s línea(s).',
+                            sale_order.name, self.name, len(diferencias))
+        except Exception:
+            _logger.exception('No se pudieron revisar los totales de la cotización %s contra la compra %s.',
+                              sale_order.name, self.name)
+            sale_order.sudo().message_post(body=_(
+                'No se pudieron revisar los totales contra la compra %s. Revisa a mano que los totales coincidan.'
+            ) % self.name)
